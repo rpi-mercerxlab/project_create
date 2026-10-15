@@ -1,15 +1,27 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:math' as math;
+
 import 'package:google_generative_ai/google_generative_ai.dart';
+import 'package:http/http.dart' as http;
+
+const _apiKey = String.fromEnvironment('GEMINI_API_KEY');
+const _apiBaseUrl = String.fromEnvironment('LUXI_API_URL');
 
 final _model = GenerativeModel(
-  model: 'gemini-2.5-flash', // Use 1.5, not 2.5
-  apiKey: '', // Your key
+  model: 'gemini-3.5-flash',
+  apiKey: _apiKey,
   generationConfig: GenerationConfig(
-  maxOutputTokens: 20000,
-),
+    maxOutputTokens: 20000,
+  ),
 );
 
-Future<String> askAI(String userInput, List<String> userinputcourses) async {
-  
+Future<String> askAI(
+  String userInput,
+  List<String> userinputcourses, {
+  void Function(String text)? onProgress,
+  bool includeCourseCatalog = true,
+}) async {
   final data = [
     {
     "course_code": "1010",
@@ -515,7 +527,12 @@ Future<String> askAI(String userInput, List<String> userinputcourses) async {
     ]
   }
   ];
-  final selectedCourses = data.where((course) => userinputcourses.contains(course['course_code'])).toList();
+  String normalizeCourse(Object? value) => (value ?? '').toString().replaceAll(RegExp(r'[^0-9A-Za-z]'), '').toUpperCase();
+  final requestedCodes = userinputcourses.map(normalizeCourse).toSet();
+  final selectedCourses = data.where((course) {
+    final catalogCode = normalizeCourse(course['course_code']);
+    return requestedCodes.any((code) => code == catalogCode || code.endsWith(catalogCode));
+  }).toList();
 
   // Convert to string for AI
   final coursesText = selectedCourses.map((course) {
@@ -525,16 +542,89 @@ Future<String> askAI(String userInput, List<String> userinputcourses) async {
   }).join('\n\n');
 
 
-  final finalPrompt = '$userInput\n\nRelevant Courses:\n$coursesText';
+  final courseContext = includeCourseCatalog && coursesText.isNotEmpty
+      ? '\nRelevant course catalog entries:\n$coursesText'
+      : '';
+  final roleInstruction = includeCourseCatalog
+      ? 'Give specific, accurate, student-buildable advice. Use the supplied course catalog as the source of truth and do not invent course content.'
+      : 'Give specific, accurate, student-buildable advice. Use the project outline and supplied step request as the source of truth; do not add unrelated course descriptions.';
+  final finalPrompt = '''You are Luxi, a practical engineering project mentor. $roleInstruction
 
-  try {
-    final response = await _model.generateContent([
-      Content.text(finalPrompt),
-    ]);
+$userInput$courseContext
+''';
 
-    return response.text ?? 'No response generated';
-  } catch (e) {
-    print('AI ERROR: $e');
-    return 'Error generating response: $e';
+  const maxAttempts = 3;
+  for (var attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      if (_apiBaseUrl.isNotEmpty) {
+        final baseUrl = _apiBaseUrl.replaceFirst(RegExp(r'/+$'), '');
+        final response = await http.post(
+          Uri.parse('$baseUrl/askAI'),
+          headers: const {'Content-Type': 'application/json'},
+          body: jsonEncode({'prompt': finalPrompt}),
+        ).timeout(const Duration(seconds: 185));
+        final body = jsonDecode(response.body) as Map<String, dynamic>;
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          throw Exception(
+            'HTTP ${response.statusCode}: ${body['error']?.toString() ?? 'The AI request failed.'}',
+          );
+        }
+        final text = body['text']?.toString().trim();
+        if (text == null || text.isEmpty) {
+          throw Exception('The AI returned an empty response. Please try again.');
+        }
+        onProgress?.call(text);
+        return text;
+      }
+
+      if (_apiKey.isEmpty) {
+        throw StateError('Add GEMINI_API_KEY with --dart-define to enable project suggestions.');
+      }
+      final responseStream = _model.generateContentStream([
+        Content.text(finalPrompt),
+      ]).timeout(const Duration(seconds: 180));
+
+      final generated = StringBuffer();
+      await for (final response in responseStream) {
+        final chunk = response.text ?? '';
+        if (chunk.isEmpty) continue;
+        generated.write(chunk);
+        onProgress?.call(generated.toString());
+      }
+
+      final text = generated.toString().trim();
+      if (text.isEmpty) throw Exception('The AI returned an empty response. Please try again.');
+      return text;
+    } catch (error) {
+      final shouldRetry =
+          attempt + 1 < maxAttempts && _isTransientAIError(error);
+      if (shouldRetry) {
+        final backoffMilliseconds = 1000 * (1 << attempt);
+        final jitterMilliseconds = math.Random().nextInt(500);
+        await Future<void>.delayed(
+          Duration(milliseconds: backoffMilliseconds + jitterMilliseconds),
+        );
+        continue;
+      }
+      if (error is TimeoutException) {
+        throw Exception('The request took too long. Check your connection and try again.');
+      }
+      rethrow;
+    }
   }
+  throw StateError('The AI request could not be completed.');
+}
+
+bool _isTransientAIError(Object error) {
+  final message = error.toString().toLowerCase();
+  if (message.contains('quota_exceeded') || message.contains('daily quota')) {
+    return false;
+  }
+  if (error is TimeoutException || error is http.ClientException) return true;
+  return RegExp(r'\b(408|429|500|502|503|504)\b').hasMatch(message) ||
+      message.contains('high demand') ||
+      message.contains('resource_exhausted') ||
+      message.contains('service unavailable') ||
+      message.contains('socketexception') ||
+      message.contains('handshakeexception');
 }
